@@ -100,10 +100,9 @@ impl Decoder for MumbleCodec {
         let msg_type_raw = header.get_u16();
         let length = header.get_u32() as usize;
 
-        if length > 8 * 1024 * 1024 {
-            return Err(anyhow::anyhow!("Payload too large"));
-        }
-
+	if length > 64 * 1024 {
+    		return Err(anyhow::anyhow!("Payload too large"));
+	}
         if src.len() < 6 + length {
             return Ok(None);
         }
@@ -139,22 +138,26 @@ mod protobuf {
         result
     }
 
-    pub fn decode_varint(data: &[u8]) -> Result<(u64, usize)> {
-        let mut result = 0;
-        let mut shift = 0;
-        let mut pos = 0;
-        while pos < data.len() {
-            let byte = data[pos];
-            pos += 1;
-            result |= ((byte & 0x7F) as u64) << shift;
-            if (byte & 0x80) == 0 {
-                return Ok((result, pos));
-            }
-            shift += 7;
+pub fn decode_varint(data: &[u8]) -> Result<(u64, usize)> {
+    let mut result = 0;
+    let mut shift = 0;
+    let mut pos = 0;
+    while pos < data.len() {
+        // FIX: Prevent the shift from overflowing and panicking Rust
+        if shift >= 64 {
+            return Err(anyhow!("Malformed varint: shift overflow"));
         }
-        Err(anyhow!("Truncated varint"))
-    }
 
+        let byte = data[pos];
+        pos += 1;
+        result |= ((byte & 0x7F) as u64) << shift;
+        if (byte & 0x80) == 0 {
+            return Ok((result, pos));
+        }
+        shift += 7;
+    }
+    Err(anyhow!("Truncated varint"))
+}
     pub fn encode_field(field_num: u32, wire_type: u8, mut payload: Vec<u8>) -> Vec<u8> {
         let mut result = Vec::new();
         let tag = (field_num << 3) | (wire_type as u32);
