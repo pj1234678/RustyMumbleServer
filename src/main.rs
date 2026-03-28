@@ -8,17 +8,18 @@ use rustls_pemfile::{certs, private_key};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, IpAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_rustls::rustls::{pki_types::CertificateDer, pki_types::PrivateKeyDer, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::{Decoder, Encoder, Framed};
- use std::hint::black_box;
+use std::hint::black_box;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 enum MessageType {
@@ -100,9 +101,9 @@ impl Decoder for MumbleCodec {
         let msg_type_raw = header.get_u16();
         let length = header.get_u32() as usize;
 
-	if length > 64 * 1024 {
-    		return Err(anyhow::anyhow!("Payload too large"));
-	}
+        if length > 64 * 1024 {
+            return Err(anyhow::anyhow!("Payload too large"));
+        }
         if src.len() < 6 + length {
             return Ok(None);
         }
@@ -138,26 +139,26 @@ mod protobuf {
         result
     }
 
-pub fn decode_varint(data: &[u8]) -> Result<(u64, usize)> {
-    let mut result = 0;
-    let mut shift = 0;
-    let mut pos = 0;
-    while pos < data.len() {
-        // FIX: Prevent the shift from overflowing and panicking Rust
-        if shift >= 64 {
-            return Err(anyhow!("Malformed varint: shift overflow"));
-        }
+    pub fn decode_varint(data: &[u8]) -> Result<(u64, usize)> {
+        let mut result = 0;
+        let mut shift = 0;
+        let mut pos = 0;
+        while pos < data.len() {
+            if shift >= 64 {
+                return Err(anyhow!("Malformed varint: shift overflow"));
+            }
 
-        let byte = data[pos];
-        pos += 1;
-        result |= ((byte & 0x7F) as u64) << shift;
-        if (byte & 0x80) == 0 {
-            return Ok((result, pos));
+            let byte = data[pos];
+            pos += 1;
+            result |= ((byte & 0x7F) as u64) << shift;
+            if (byte & 0x80) == 0 {
+                return Ok((result, pos));
+            }
+            shift += 7;
         }
-        shift += 7;
+        Err(anyhow!("Truncated varint"))
     }
-    Err(anyhow!("Truncated varint"))
-}
+
     pub fn encode_field(field_num: u32, wire_type: u8, mut payload: Vec<u8>) -> Vec<u8> {
         let mut result = Vec::new();
         let tag = (field_num << 3) | (wire_type as u32);
@@ -702,6 +703,12 @@ mod messages {
 }
 
 #[derive(Debug, Clone)]
+struct AuthAttempt {
+    count: u32,
+    last_failed: Instant,
+}
+
+#[derive(Debug, Clone)]
 struct Channel {
     channel_id: u32,
     parent_id: i32,
@@ -733,6 +740,7 @@ struct MumbleServer {
     channels: DashMap<u32, Channel>,
     users: DashMap<u32, User>,
     client_handlers: DashMap<u32, ClientSender>,
+    failed_auths: DashMap<IpAddr, AuthAttempt>,
     next_session_id: AtomicU32,
     next_channel_id: AtomicU32,
     version: u32,
@@ -746,6 +754,7 @@ impl MumbleServer {
             channels: DashMap::new(),
             users: DashMap::new(),
             client_handlers: DashMap::new(),
+            failed_auths: DashMap::new(),
             next_session_id: AtomicU32::new(1),
             next_channel_id: AtomicU32::new(1),
             version: (1 << 16) | (4 << 8) | 0,
@@ -826,15 +835,45 @@ impl MumbleServer {
           
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let listener = TcpListener::bind(addr).await?;
+        
+        let connection_limit = Arc::new(tokio::sync::Semaphore::new(1000));
           
         info!("Server listening on {}", addr);
 
+        // BACKGROUND TASK: Clean up stale rate-limit entries every 10 minutes
+        let cleanup_server = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(600)); 
+            loop {
+                interval.tick().await;
+                // Evict IPs that haven't tried to connect in over 5 minutes
+                cleanup_server.failed_auths.retain(|_, attempt| attempt.last_failed.elapsed() < Duration::from_secs(300));
+            }
+        });
+
         loop {
-            let (stream, peer_addr) = listener.accept().await?;
+            let permit = match connection_limit.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    error!("Connection limit semaphore closed");
+                    break;
+                }
+            };
+
+            let (stream, peer_addr) = match listener.accept().await {
+                Ok(res) => res,
+                Err(e) => {
+                    error!("TCP accept error: {}", e);
+                    continue; 
+                }
+            };
+            
             let acceptor = acceptor.clone();
             let server_arc = self.clone();
 
             tokio::spawn(async move {
+                let _permit = permit;
+                
                 info!("New connection from {}", peer_addr);
                 let stream = match acceptor.accept(stream).await {
                     Ok(s) => s,
@@ -850,6 +889,8 @@ impl MumbleServer {
                 }
             });
         }
+        
+        Ok(())
     }
 }
 
@@ -903,8 +944,15 @@ impl ClientHandler {
 
         debug!("Starting connection handling for {}", self.addr);
 
+        let auth_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
         loop {
             tokio::select! {
+                _ = tokio::time::sleep_until(auth_deadline), if self.session_id.is_none() => {
+                    warn!("Client at {} failed to authenticate within 10 seconds. Dropping.", self.addr);
+                    break;
+                }
+
                 result = reader.next() => {
                     match result {
                         Some(Ok((msg_type_raw, payload))) => {
@@ -984,27 +1032,39 @@ impl ClientHandler {
         Ok(())
     }
 
-    async fn handle_message(&mut self, msg_type: MessageType, payload: Bytes) -> Result<()> {
-         if msg_type != MessageType::UdpTunnel && msg_type != MessageType::Ping {
-            debug!("Processing {:?} from session {:?}", msg_type, self.session_id);
-        }
+async fn handle_message(&mut self, msg_type: MessageType, payload: Bytes) -> Result<()> {
+    if msg_type != MessageType::UdpTunnel && msg_type != MessageType::Ping {
+        debug!("Processing {:?} from session {:?}", msg_type, self.session_id);
+    }
 
+    if self.session_id.is_none() {
         match msg_type {
-            MessageType::Version => self.handle_version(&payload).await,
-            MessageType::Authenticate => self.handle_authenticate(&payload).await,
-            MessageType::Ping => self.handle_ping(&payload).await,
-            MessageType::UdpTunnel => self.handle_udp_tunnel(&payload).await,
-            MessageType::PermissionQuery => self.handle_permission_query(&payload).await,
-            MessageType::CodecVersion => self.handle_codec_version(&payload).await,
-            MessageType::TextMessage => self.handle_text_message(&payload).await,
-            MessageType::UserStats => self.handle_user_stats(&payload).await,
-            MessageType::UserState => self.handle_user_state_change(&payload).await,
+            MessageType::Version => return self.handle_version(&payload).await,
+            MessageType::Authenticate => return self.handle_authenticate(&payload).await,
+            MessageType::Ping => return self.handle_ping(&payload).await,
             _ => {
-                debug!("Unhandled message type: {:?}", msg_type);
-                Ok(())
+                warn!("Client at {} sent {:?} before authenticating. Dropping.", self.addr, msg_type);
+                return Err(anyhow::anyhow!("Unauthenticated request rejected"));
             }
         }
     }
+
+    match msg_type {
+        MessageType::Version => self.handle_version(&payload).await,
+        MessageType::Authenticate => self.handle_authenticate(&payload).await, 
+        MessageType::Ping => self.handle_ping(&payload).await,
+        MessageType::UdpTunnel => self.handle_udp_tunnel(&payload).await,
+        MessageType::PermissionQuery => self.handle_permission_query(&payload).await,
+        MessageType::CodecVersion => self.handle_codec_version(&payload).await,
+        MessageType::TextMessage => self.handle_text_message(&payload).await,
+        MessageType::UserStats => self.handle_user_stats(&payload).await,
+        MessageType::UserState => self.handle_user_state_change(&payload).await,
+        _ => {
+            debug!("Unhandled message type: {:?}", msg_type);
+            Ok(())
+        }
+    }
+}      
       
     async fn handle_version(&self, payload: &[u8]) -> Result<()> {
         let client_version = messages::Version::decode(payload)?;
@@ -1022,32 +1082,63 @@ impl ClientHandler {
         Ok(())
     }
 
-	async fn handle_authenticate(&mut self, payload: &[u8]) -> Result<()> {
+    async fn handle_authenticate(&mut self, payload: &[u8]) -> Result<()> {
         if self.session_id.is_some() {
             warn!("Client at {} attempted to re-authenticate. Disconnecting.", self.addr);
             return Err(anyhow!("Re-authentication not allowed on active session"));
+        }
+
+        let ip = self.addr.ip();
+        let max_attempts = 5;
+        let lockout_duration = Duration::from_secs(300);
+
+        if let Some(mut attempt) = self.server.failed_auths.get_mut(&ip) {
+            if attempt.count >= max_attempts {
+                if attempt.last_failed.elapsed() < lockout_duration {
+                    warn!("Client at {} rejected: IP temporarily banned due to rate limiting.", ip);
+                    
+                    let reject_msg = messages::Reject {
+                        reject_type: 4, 
+                        reason: "Too many failed login attempts. Try again in 5 minutes.".to_string(),
+                    };
+                    self.send_message(MessageType::Reject, Bytes::from(reject_msg.encode())).await?;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    
+                    return Err(anyhow::anyhow!("Rate limited"));
+                } else {
+                    attempt.count = 0;
+                }
+            }
         }
 
         let auth = messages::Authenticate::decode(payload)?;
         info!("Authentication request: username={}, opus={}", auth.username, auth.opus);
 
         if let Some(server_password) = &self.server.password {
-            // FIX: Use constant-time comparison instead of `auth.password != *server_password`
-            if !constant_time_eq(auth.password.as_bytes(), server_password.as_bytes()) {
+            if !secure_compare_password(&auth.password, server_password) {
                 warn!("Client at {} rejected: Incorrect or missing password.", self.addr);
                 
+                let mut attempt = self.server.failed_auths
+                    .entry(ip)
+                    .or_insert(AuthAttempt { count: 0, last_failed: Instant::now() });
+                
+                attempt.count += 1;
+                attempt.last_failed = Instant::now();
+
                 let reject_msg = messages::Reject {
                     reject_type: 4, 
                     reason: "Password required to join this server.".to_string(),
                 };
                 
                 self.send_message(MessageType::Reject, Bytes::from(reject_msg.encode())).await?;
-                
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 
-                return Err(anyhow!("Authentication failed: wrong or missing password"));
+                return Err(anyhow::anyhow!("Authentication failed: wrong or missing password"));
             }
         }
+
+        self.server.failed_auths.remove(&ip);
+
         let session_id = self.server.allocate_session();
         debug!("Allocated session ID: {}", session_id);
         self.session_id = Some(session_id);
@@ -1294,7 +1385,12 @@ impl ClientHandler {
         let session_id = self.session_id.unwrap_or(0);
 
         let sender_name = self.server.users.get(&session_id).map_or_else(|| format!("Session {}", session_id), |u| u.name.clone());
-        info!("Text message from {} (session {}): '{}'", sender_name, session_id, msg.message);
+        
+        // SAFE TRUNCATION: Restrict message length to 2000 characters to prevent DoS.
+        // Using .chars().take() avoids panicking on multi-byte unicode characters.
+        let safe_message: String = msg.message.chars().take(2000).collect();
+        
+        info!("Text message from {} (session {}): '{}'", sender_name, session_id, safe_message);
           
         let mut recipients = HashSet::new();
         if !msg.channel_id.is_empty() {
@@ -1309,16 +1405,15 @@ impl ClientHandler {
             }
         }
           
-	let response = messages::TextMessage {
+        let response = messages::TextMessage {
             actor: session_id,
-            message: msg.message,
+            message: safe_message,
             channel_id: msg.channel_id,
             ..Default::default()
         };
         let response_bytes = Bytes::from(response.encode());
           
         for recipient_id in recipients {
-            // FIX: Prevent sending the message back to the person who sent it
             if recipient_id == session_id { 
                 continue; 
             }
@@ -1329,6 +1424,7 @@ impl ClientHandler {
         }
         Ok(())
     }      
+      
     async fn handle_user_stats(&self, payload: &[u8]) -> Result<()> {
         let stats_req = messages::UserStats::decode(payload)?;
         info!("UserStats request for session {}", stats_req.session);
@@ -1368,14 +1464,14 @@ impl ClientHandler {
         }
 
         if let Some(mut user) = self.server.users.get_mut(&session_id) {
+            // ONLY allow clients to change their own self-service fields
             if let Some(&val) = changes.get("channel_id") { user.channel_id = val as u32; }
             if let Some(&val) = changes.get("self_mute") { user.self_mute = val != 0; }
             if let Some(&val) = changes.get("self_deaf") { user.self_deaf = val != 0; }
-            if let Some(&val) = changes.get("mute") { user.mute = val != 0; }
-            if let Some(&val) = changes.get("deaf") { user.deaf = val != 0; }
-            if let Some(&val) = changes.get("suppress") { user.suppress = val != 0; }
-            if let Some(&val) = changes.get("priority_speaker") { user.priority_speaker = val != 0; }
             if let Some(&val) = changes.get("recording") { user.recording = val != 0; }
+            
+            // Note: We deliberately ignore "mute", "deaf", "suppress", and "priority_speaker" 
+            // as those are server-enforced and cannot be changed by the client.
             
             updated_user_state = Some(user.clone());
         } 
@@ -1466,19 +1562,29 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+fn secure_compare_password(provided: &str, expected: &str) -> bool {
+    let provided_bytes = provided.as_bytes();
+    let expected_bytes = expected.as_bytes();
 
     let mut result = 0;
-    for i in 0..a.len() {
-        // XOR (^) evaluates to 0 if the bytes are identical.
-        // OR (|) accumulates any differences without branching.
-        result |= a[i] ^ b[i];
+    
+    // Check if lengths match without branching (1 if true, 0 if false)
+    let lengths_match = (provided_bytes.len() == expected_bytes.len()) as u8;
+
+    for i in 0..128 {
+        // Fetch the byte if it exists, otherwise use a dummy byte (0)
+        // .get() avoids out-of-bounds panics without explicit if/else branches
+        let p_byte = provided_bytes.get(i).copied().unwrap_or(0);
+        let e_byte = expected_bytes.get(i).copied().unwrap_or(0);
+
+        // XOR will be 0 if the bytes match. OR accumulates any differences.
+        result |= p_byte ^ e_byte;
     }
 
-    // black_box prevents the compiler from outsmarting us and 
-    // replacing this loop with a short-circuiting `memcmp`.
-    black_box(result) == 0
+    // result is 0 ONLY if all characters up to 128 matched.
+    // lengths_match is 1 ONLY if the actual lengths were identical.
+    let is_match = (result == 0) & (lengths_match == 1);
+
+    // black_box forces the compiler to evaluate the entire boolean expression
+    black_box(is_match)
 }
