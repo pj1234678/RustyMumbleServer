@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Result};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use dashmap::DashMap;
+use futures::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use rand::Rng;
 use rustls_pemfile::{certs, private_key};
@@ -10,13 +12,13 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_rustls::rustls::{pki_types::CertificateDer, pki_types::PrivateKeyDer, ServerConfig};
 use tokio_rustls::TlsAcceptor;
+use tokio_util::codec::{Decoder, Encoder, Framed};
 
-// Re-implementation of Python's IntEnum for message types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 enum MessageType {
@@ -84,7 +86,46 @@ impl TryFrom<u16> for MessageType {
     }
 }
 
-// Manual Protobuf implementation to match the Python script
+struct MumbleCodec;
+
+impl Decoder for MumbleCodec {
+    type Item = (u16, Bytes);
+    type Error = anyhow::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
+        if src.len() < 6 {
+            return Ok(None);
+        }
+        let mut header = &src[..6];
+        let msg_type_raw = header.get_u16();
+        let length = header.get_u32() as usize;
+
+        if length > 8 * 1024 * 1024 {
+            return Err(anyhow::anyhow!("Payload too large"));
+        }
+
+        if src.len() < 6 + length {
+            return Ok(None);
+        }
+
+        src.advance(6);
+        let payload = src.split_to(length).freeze();
+        Ok(Some((msg_type_raw, payload)))
+    }
+}
+
+impl Encoder<(MessageType, Bytes)> for MumbleCodec {
+    type Error = anyhow::Error;
+
+    fn encode(&mut self, item: (MessageType, Bytes), dst: &mut BytesMut) -> Result<()> {
+        dst.reserve(6 + item.1.len());
+        dst.put_u16(item.0 as u16);
+        dst.put_u32(item.1.len() as u32);
+        dst.put(item.1);
+        Ok(())
+    }
+}
+
 mod protobuf {
     use super::*;
 
@@ -165,24 +206,32 @@ mod protobuf {
         let wire_type = (tag_value & 0x7) as u8;
 
         let (value, varint_val) = match wire_type {
-            0 => { // Varint
+            0 => {
                 let (val, len) = decode_varint(&data[offset..])?;
                 offset += len;
-                (data[offset - len..offset].to_vec(), Some(val))
+                let val_bytes = data[offset - len..offset].to_vec();
+                (val_bytes, Some(val))
             }
-            2 => { // Length-delimited
+            2 => {
                 let (length, len) = decode_varint(&data[offset..])?;
                 offset += len;
-                let end = offset + length as usize;
+                let length_usize = length as usize;
+                let end = offset.checked_add(length_usize).ok_or_else(|| anyhow!("Field length overflow"))?;
+                if end > data.len() {
+                    return Err(anyhow!("Truncated field"));
+                }
                 let val = data[offset..end].to_vec();
                 offset = end;
                 (val, None)
             }
-            5 => { // 32-bit
-                 let end = offset + 4;
-                 let val = data[offset..end].to_vec();
-                 offset = end;
-                 (val, None)
+            5 => {
+                let end = offset.checked_add(4).ok_or_else(|| anyhow!("32-bit field overflow"))?;
+                if end > data.len() {
+                    return Err(anyhow!("Truncated 32-bit field"));
+                }
+                let val = data[offset..end].to_vec();
+                offset = end;
+                (val, None)
             }
             _ => return Err(anyhow!("Unsupported wire type: {}", wire_type)),
         };
@@ -198,12 +247,12 @@ mod protobuf {
         )))
     }
 }
-// Structs for each message type with encode/decode methods
+
 mod messages {
     use super::*;
     use protobuf::*;
     use std::str;
-    
+      
     #[derive(Debug, Default)]
     pub struct Version {
         pub version: u32,
@@ -263,9 +312,19 @@ mod messages {
             while let Some((field, new_offset)) = decode_field(&data[offset..])? {
                 offset += new_offset;
                 match field.num {
-                    1 => msg.username = str::from_utf8(&field.value)?.to_string(),
-                    2 => msg.password = str::from_utf8(&field.value)?.to_string(),
-                    3 => msg.tokens.push(str::from_utf8(&field.value)?.to_string()),
+                    1 => {
+                        if field.value.len() > 64 {
+                            return Err(anyhow::anyhow!("Username too long"));
+                        }
+                        msg.username = std::str::from_utf8(&field.value)?.to_string();
+                    },
+                    2 => {
+                        if field.value.len() > 128 {
+                            return Err(anyhow::anyhow!("Password too long"));
+                        }
+                        msg.password = std::str::from_utf8(&field.value)?.to_string();
+                    },
+                    3 => msg.tokens.push(std::str::from_utf8(&field.value)?.to_string()),
                     4 => msg.celt_versions.push(field.varint_val.unwrap_or(0) as i32),
                     5 => msg.opus = field.varint_val.unwrap_or(0) != 0,
                     _ => {}
@@ -274,7 +333,7 @@ mod messages {
             Ok(msg)
         }
     }
-    
+      
     #[derive(Default)]
     pub struct CryptSetup {
         pub key: Vec<u8>,
@@ -340,15 +399,15 @@ mod messages {
         pub actor: Option<u32>,
         pub name: String,
         pub channel_id: u32,
-        pub mute: bool,
-        pub deaf: bool,
-        pub suppress: bool,
-        pub self_mute: bool,
-        pub self_deaf: bool,
+        pub mute: Option<bool>,
+        pub deaf: Option<bool>,
+        pub suppress: Option<bool>,
+        pub self_mute: Option<bool>,
+        pub self_deaf: Option<bool>,
         pub comment: String,
         pub hash: String,
-        pub priority_speaker: bool,
-        pub recording: bool,
+        pub priority_speaker: Option<bool>,
+        pub recording: Option<bool>,
     }
 
     impl UserState {
@@ -362,19 +421,23 @@ mod messages {
                 result.append(&mut encode_string(3, &self.name));
             }
             result.append(&mut encode_uint32(5, self.channel_id));
-            if self.mute { result.append(&mut encode_bool(6, self.mute)); }
-            if self.deaf { result.append(&mut encode_bool(7, self.deaf)); }
-            if self.suppress { result.append(&mut encode_bool(8, self.suppress)); }
-            if self.self_mute { result.append(&mut encode_bool(9, self.self_mute)); }
-            if self.self_deaf { result.append(&mut encode_bool(10, self.self_deaf)); }
+            
+            if let Some(val) = self.mute { result.append(&mut encode_bool(6, val)); }
+            if let Some(val) = self.deaf { result.append(&mut encode_bool(7, val)); }
+            if let Some(val) = self.suppress { result.append(&mut encode_bool(8, val)); }
+            if let Some(val) = self.self_mute { result.append(&mut encode_bool(9, val)); }
+            if let Some(val) = self.self_deaf { result.append(&mut encode_bool(10, val)); }
+            
             if !self.comment.is_empty() {
                 result.append(&mut encode_string(14, &self.comment));
             }
             if !self.hash.is_empty() {
                 result.append(&mut encode_string(15, &self.hash));
             }
-            if self.priority_speaker { result.append(&mut encode_bool(17, self.priority_speaker)); }
-            if self.recording { result.append(&mut encode_bool(18, self.recording)); }
+            
+            if let Some(val) = self.priority_speaker { result.append(&mut encode_bool(17, val)); }
+            if let Some(val) = self.recording { result.append(&mut encode_bool(18, val)); }
+            
             result
         }
 
@@ -408,7 +471,7 @@ mod messages {
         pub welcome_text: String,
         pub permissions: u64,
     }
-    
+      
     impl ServerSync {
         pub fn encode(&self) -> Vec<u8> {
             let mut result = Vec::new();
@@ -447,7 +510,6 @@ mod messages {
             if self.timestamp > 0 {
                 result.append(&mut encode_field(1, 0, encode_varint(self.timestamp)));
             }
-            // Other fields are not sent by the server in this implementation
             result
         }
 
@@ -464,25 +526,26 @@ mod messages {
                     5 => msg.resync = field.varint_val.unwrap_or(0) as u32,
                     6 => msg.udp_packets = field.varint_val.unwrap_or(0) as u32,
                     7 => msg.tcp_packets = field.varint_val.unwrap_or(0) as u32,
-                    8 => msg.udp_ping_avg = f32::from_le_bytes(field.value[..4].try_into()?),
-                    9 => msg.udp_ping_var = f32::from_le_bytes(field.value[..4].try_into()?),
-                    10 => msg.tcp_ping_avg = f32::from_le_bytes(field.value[..4].try_into()?),
-                    11 => msg.tcp_ping_var = f32::from_le_bytes(field.value[..4].try_into()?),
+                    8 => if field.value.len() >= 4 { msg.udp_ping_avg = f32::from_le_bytes(field.value[..4].try_into()?) },
+                    9 => if field.value.len() >= 4 { msg.udp_ping_var = f32::from_le_bytes(field.value[..4].try_into()?) },
+                    10 => if field.value.len() >= 4 { msg.tcp_ping_avg = f32::from_le_bytes(field.value[..4].try_into()?) },
+                    11 => if field.value.len() >= 4 { msg.tcp_ping_var = f32::from_le_bytes(field.value[..4].try_into()?) },
                     _ => {}
                 }
             }
             Ok(msg)
         }
     }
-    
+      
     pub struct Reject {
+        pub reject_type: u32,
         pub reason: String,
     }
 
     impl Reject {
         pub fn encode(&self) -> Vec<u8> {
             let mut result = Vec::new();
-            result.append(&mut encode_uint32(1, 0)); // type=0
+            result.append(&mut encode_uint32(1, self.reject_type));
             if !self.reason.is_empty() {
                 result.append(&mut encode_string(2, &self.reason));
             }
@@ -556,7 +619,7 @@ mod messages {
             Ok(msg)
         }
     }
-    
+      
     #[derive(Debug, Default)]
     pub struct TextMessage {
         pub actor: u32,
@@ -609,7 +672,7 @@ mod messages {
          pub fn encode(&self) -> Vec<u8> {
             let mut result = Vec::new();
             result.append(&mut encode_uint32(1, self.session));
-            result.append(&mut encode_bool(2, false)); // stats_only=false
+            result.append(&mut encode_bool(2, false));
             result
         }
         pub fn decode(data: &[u8]) -> Result<Self> {
@@ -623,11 +686,11 @@ mod messages {
             Ok(msg)
         }
     }
-    
+      
     pub struct UserRemove {
         pub session: u32,
     }
-    
+      
     impl UserRemove {
         pub fn encode(&self) -> Vec<u8> {
             encode_uint32(1, self.session)
@@ -635,7 +698,6 @@ mod messages {
     }
 }
 
-// Server state structures
 #[derive(Debug, Clone)]
 struct Channel {
     channel_id: u32,
@@ -661,39 +723,42 @@ struct User {
     priority_speaker: bool,
     recording: bool,
 }
-// Shared server state
-type ClientSender = mpsc::Sender<Vec<u8>>;
 
-#[derive(Default)]
-struct ServerState {
-    channels: HashMap<u32, Channel>,
-    users: HashMap<u32, User>,
-    client_handlers: HashMap<u32, ClientSender>,
-}
+type ClientSender = mpsc::Sender<(MessageType, Bytes)>;
 
 struct MumbleServer {
-    state: Arc<RwLock<ServerState>>,
+    channels: DashMap<u32, Channel>,
+    users: DashMap<u32, User>,
+    client_handlers: DashMap<u32, ClientSender>,
     next_session_id: AtomicU32,
     next_channel_id: AtomicU32,
     version: u32,
     release: String,
+    password: Option<String>,
 }
 
 impl MumbleServer {
-    fn new() -> Self {
+    fn new(password: Option<String>) -> Self {
         let server = MumbleServer {
-            state: Arc::new(RwLock::new(ServerState::default())),
+            channels: DashMap::new(),
+            users: DashMap::new(),
+            client_handlers: DashMap::new(),
             next_session_id: AtomicU32::new(1),
             next_channel_id: AtomicU32::new(1),
             version: (1 << 16) | (4 << 8) | 0,
             release: "1.4.0".to_string(),
+            password,
         };
         info!("Mumble Server initialized - Version {}", server.release);
+        if server.password.is_some() {
+            info!("Server password protection is ENABLED");
+        } else {
+            warn!("Server password protection is DISABLED");
+        }
         server
     }
-    
+      
     async fn init_root_channel(&self) {
-        let mut state = self.state.write().await;
         let root = Channel {
             channel_id: 0,
             parent_id: -1,
@@ -704,12 +769,11 @@ impl MumbleServer {
             links: HashSet::new(),
             users: HashSet::new(),
         };
-        state.channels.insert(0, root);
+        self.channels.insert(0, root);
         debug!("Root channel created");
     }
 
     async fn create_channel(&self, name: &str, parent_id: u32) {
-        let mut state = self.state.write().await;
         let channel_id = self.next_channel_id.fetch_add(1, Ordering::SeqCst);
         let channel = Channel {
             channel_id,
@@ -722,9 +786,9 @@ impl MumbleServer {
             users: HashSet::new(),
         };
         debug!("Channel created: {} (ID: {})", name, channel_id);
-        state.channels.insert(channel_id, channel);
+        self.channels.insert(channel_id, channel);
     }
-    
+      
     fn allocate_session(&self) -> u32 {
         self.next_session_id.fetch_add(1, Ordering::SeqCst)
     }
@@ -732,21 +796,18 @@ impl MumbleServer {
     async fn broadcast_message(
         &self,
         msg_type: MessageType,
-        payload: Vec<u8>,
+        payload: Bytes,
         exclude_session: Option<u32>,
     ) {
-        let state = self.state.read().await;
-        let mut message = Vec::with_capacity(6 + payload.len());
-        message.put_u16(msg_type as u16);
-        message.put_u32(payload.len() as u32);
-        message.extend(&payload);
+        let senders: Vec<ClientSender> = self.client_handlers
+            .iter()
+            .filter(|kv| Some(*kv.key()) != exclude_session)
+            .map(|kv| kv.value().clone())
+            .collect();
 
-        for (session_id, tx) in &state.client_handlers {
-            if Some(*session_id) == exclude_session {
-                continue;
-            }
-            if let Err(e) = tx.send(message.clone()).await {
-                error!("Failed to broadcast to session {}: {}", session_id, e);
+        for tx in senders {
+            if let Err(e) = tx.send((msg_type, payload.clone())).await {
+                debug!("Failed to broadcast: {}", e);
             }
         }
     }
@@ -754,15 +815,15 @@ impl MumbleServer {
     async fn start(self: Arc<Self>, addr: &str, certfile: &str, keyfile: &str) -> Result<()> {
         let certs = load_certs(certfile)?;
         let key = load_private_key(keyfile)?;
-        
+          
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| anyhow!("Failed to create TLS config: {}", e))?;
-        
+          
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let listener = TcpListener::bind(addr).await?;
-        
+          
         info!("Server listening on {}", addr);
 
         loop {
@@ -789,14 +850,13 @@ impl MumbleServer {
     }
 }
 
-// Client Handling Logic
 struct ClientHandler {
     server: Arc<MumbleServer>,
     addr: SocketAddr,
     session_id: Option<u32>,
-    last_ping: Arc<RwLock<SystemTime>>,
+    last_ping: Arc<tokio::sync::RwLock<SystemTime>>,
     tx: Option<ClientSender>,
-    shutdown_tx: Option<mpsc::Sender<()>>, // Add this field
+    shutdown_tx: Option<mpsc::Sender<()>>,
 }
 
 impl ClientHandler {
@@ -805,90 +865,81 @@ impl ClientHandler {
             server,
             addr,
             session_id: None,
-            last_ping: Arc::new(RwLock::new(SystemTime::now())),
+            last_ping: Arc::new(tokio::sync::RwLock::new(SystemTime::now())),
             tx: None,
-            shutdown_tx: None, // Initialize
+            shutdown_tx: None,
         }
     }
 
     async fn handle(&mut self, stream: tokio_rustls::server::TlsStream<TcpStream>) -> Result<()> {
-        let (mut reader, mut writer) = tokio::io::split(stream);
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
-        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1); // Create shutdown channel
+        let framed = Framed::new(stream, MumbleCodec);
+        let (mut writer, mut reader) = framed.split();
         
+        let (tx, mut rx) = mpsc::channel::<(MessageType, Bytes)>(100);
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+          
         self.tx = Some(tx.clone());
-        self.shutdown_tx = Some(shutdown_tx); // Store it
-        
+        self.shutdown_tx = Some(shutdown_tx);
+          
         let writer_task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    message = rx.recv() => {
-                        match message {
-                            Some(msg) => {
-                                if writer.write_all(&msg).await.is_err() {
-                                    break;
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                    _ = shutdown_rx.recv() => {
-                        // Shutdown signal received
+            while let Some(msg) = rx.recv().await {
+                 let write_result = timeout(Duration::from_secs(5), writer.send(msg)).await;
+                 match write_result {
+                    Ok(Ok(_)) => {},
+                    Ok(Err(e)) => {
+                        debug!("Write error: {}", e);
                         break;
                     }
-                }
+                    Err(_) => {
+                        debug!("Write timeout, client stall.");
+                        break;
+                    }
+                 }
             }
         });
 
         debug!("Starting connection handling for {}", self.addr);
-        let mut buf = BytesMut::with_capacity(1024);
 
         loop {
-            // Read header with timeout check
             tokio::select! {
-                result = reader.read_buf(&mut buf) => {
+                result = reader.next() => {
                     match result {
-                        Ok(0) => {
-                            info!("Client disconnected: {}", self.addr);
-                            break;
-                        }
-                        Ok(_) => {
-                            // Process messages
-                            while buf.len() >= 6 {
-                                let mut header = &buf[..6];
-                                let msg_type_raw = header.get_u16();
-                                let length = header.get_u32() as usize;
-
-                                if buf.len() < 6 + length {
-                                    break; // Not enough data for the full payload
+                        Some(Ok((msg_type_raw, payload))) => {
+                            let msg_type = match MessageType::try_from(msg_type_raw) {
+                                Ok(t) => t,
+                                Err(_) => {
+                                    warn!("Received unknown message type: {}", msg_type_raw);
+                                    continue;
                                 }
-                                
-                                buf.advance(6); // Consume header
-                                let payload = buf.split_to(length).to_vec();
-
-                                let msg_type = match MessageType::try_from(msg_type_raw) {
-                                    Ok(t) => t,
-                                    Err(_) => {
-                                        warn!("Received unknown message type: {}", msg_type_raw);
-                                        continue;
-                                    }
-                                };
-
-                                if msg_type != MessageType::UdpTunnel && msg_type != MessageType::Ping {
-                                    debug!("Received message: {:?} (length: {})", msg_type, length);
-                                }
-                                if let Err(e) = self.handle_message(msg_type, &payload).await {
-                                    error!("Error handling message: {}", e);
-                                    break;
-                                }
+                            };
+                            
+                            if msg_type != MessageType::UdpTunnel && msg_type != MessageType::Ping {
+                                debug!("Received message: {:?} (length: {})", msg_type, payload.len());
+                            }
+                            
+                            if let Err(e) = self.handle_message(msg_type, payload).await {
+                                error!("Error handling message: {}", e);
+                                break;
                             }
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             error!("Read error: {}", e);
+                            break;
+                        }
+                        None => {
+                            info!("Client disconnected: {}", self.addr);
                             break;
                         }
                     }
                 }
+                _ = shutdown_rx.recv() => {
+                    info!("Shutdown signal received for {}", self.addr);
+                    break;
+                }
+            }
+            
+            if self.tx.as_ref().map(|x| x.is_closed()).unwrap_or(true) {
+                break;
             }
         }
 
@@ -897,34 +948,32 @@ impl ClientHandler {
         Ok(())
     }
 
- async fn cleanup(&mut self) {
-        info!("Cleaning up connection: {} (session: {:?})", self.addr, self.session_id);
-        if let Some(session_id) = self.session_id {
-            let mut state = self.server.state.write().await;
-            if let Some(user) = state.users.remove(&session_id) {
-                if let Some(channel) = state.channels.get_mut(&user.channel_id) {
-                    channel.users.remove(&session_id);
-                }
+    async fn cleanup(&mut self) {
+        let session_id = match self.session_id {
+            Some(id) => id,
+            None => return,
+        };
+
+        info!("Cleaning up connection: {} (session: {})", self.addr, session_id);
+        
+        if let Some((_, user)) = self.server.users.remove(&session_id) {
+            if let Some(mut channel) = self.server.channels.get_mut(&user.channel_id) {
+                channel.users.remove(&session_id);
             }
-            state.client_handlers.remove(&session_id);
+            self.server.client_handlers.remove(&session_id);
             
             let remove_msg = messages::UserRemove { session: session_id };
-            drop(state); // Drop lock before broadcast
-            
-            self.server.broadcast_message(MessageType::UserRemove, remove_msg.encode(), None).await;
+            self.server.broadcast_message(MessageType::UserRemove, Bytes::from(remove_msg.encode()), None).await;
             info!("Broadcasted user removal for session {}", session_id);
         }
     }
-    
-    async fn send_message(&self, msg_type: MessageType, payload: Vec<u8>) -> Result<()> {
+      
+    async fn send_message(&self, msg_type: MessageType, payload: Bytes) -> Result<()> {
         if let Some(tx) = &self.tx {
-            let mut message = Vec::with_capacity(6 + payload.len());
-            message.put_u16(msg_type as u16);
-            message.put_u32(payload.len() as u32);
-            message.extend(&payload);
-            if tx.send(message).await.is_err() {
+            if tx.send((msg_type, payload.clone())).await.is_err() {
                 return Err(anyhow!("Failed to send message: receiver dropped"));
             }
+            
             if msg_type != MessageType::UdpTunnel && msg_type != MessageType::Ping {
                 debug!("Sent {:?} ({} bytes) to session {:?}", msg_type, payload.len(), self.session_id);
             }
@@ -932,47 +981,69 @@ impl ClientHandler {
         Ok(())
     }
 
-    async fn handle_message(&mut self, msg_type: MessageType, payload: &[u8]) -> Result<()> {
+    async fn handle_message(&mut self, msg_type: MessageType, payload: Bytes) -> Result<()> {
          if msg_type != MessageType::UdpTunnel && msg_type != MessageType::Ping {
             debug!("Processing {:?} from session {:?}", msg_type, self.session_id);
         }
 
         match msg_type {
-            MessageType::Version => self.handle_version(payload).await,
-            MessageType::Authenticate => self.handle_authenticate(payload).await,
-            MessageType::Ping => self.handle_ping(payload).await,
-            MessageType::UdpTunnel => self.handle_udp_tunnel(payload).await,
-            MessageType::PermissionQuery => self.handle_permission_query(payload).await,
-            MessageType::CodecVersion => self.handle_codec_version(payload).await,
-            MessageType::TextMessage => self.handle_text_message(payload).await,
-            MessageType::UserStats => self.handle_user_stats(payload).await,
-            MessageType::UserState => self.handle_user_state_change(payload).await,
+            MessageType::Version => self.handle_version(&payload).await,
+            MessageType::Authenticate => self.handle_authenticate(&payload).await,
+            MessageType::Ping => self.handle_ping(&payload).await,
+            MessageType::UdpTunnel => self.handle_udp_tunnel(&payload).await,
+            MessageType::PermissionQuery => self.handle_permission_query(&payload).await,
+            MessageType::CodecVersion => self.handle_codec_version(&payload).await,
+            MessageType::TextMessage => self.handle_text_message(&payload).await,
+            MessageType::UserStats => self.handle_user_stats(&payload).await,
+            MessageType::UserState => self.handle_user_state_change(&payload).await,
             _ => {
                 debug!("Unhandled message type: {:?}", msg_type);
                 Ok(())
             }
         }
     }
-    
+      
     async fn handle_version(&self, payload: &[u8]) -> Result<()> {
         let client_version = messages::Version::decode(payload)?;
         info!("Client version: {} (0x{:08x}) OS: {} {}", 
               client_version.release, client_version.version, client_version.os, client_version.os_version);
-        
+          
         let server_version = messages::Version {
             version: self.server.version,
             release: self.server.release.clone(),
             os: "Rust".to_string(),
             os_version: "1.x".to_string(),
         };
-        self.send_message(MessageType::Version, server_version.encode()).await?;
+        self.send_message(MessageType::Version, Bytes::from(server_version.encode())).await?;
         debug!("Sent server version");
         Ok(())
     }
 
-   async fn handle_authenticate(&mut self, payload: &[u8]) -> Result<()> {
+    async fn handle_authenticate(&mut self, payload: &[u8]) -> Result<()> {
+        if self.session_id.is_some() {
+            warn!("Client at {} attempted to re-authenticate. Disconnecting.", self.addr);
+            return Err(anyhow!("Re-authentication not allowed on active session"));
+        }
+
         let auth = messages::Authenticate::decode(payload)?;
         info!("Authentication request: username={}, opus={}", auth.username, auth.opus);
+
+        if let Some(server_password) = &self.server.password {
+            if auth.password != *server_password {
+                warn!("Client at {} rejected: Incorrect or missing password.", self.addr);
+                
+                let reject_msg = messages::Reject {
+                    reject_type: 4, 
+                    reason: "Password required to join this server.".to_string(),
+                };
+                
+                self.send_message(MessageType::Reject, Bytes::from(reject_msg.encode())).await?;
+                
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                
+                return Err(anyhow!("Authentication failed: wrong or missing password"));
+            }
+        }
 
         let session_id = self.server.allocate_session();
         debug!("Allocated session ID: {}", session_id);
@@ -982,17 +1053,22 @@ impl ClientHandler {
             session: session_id,
             name: if auth.username.is_empty() { format!("User{}", session_id) } else { auth.username },
             channel_id: 0,
-            mute: false, deaf: false, suppress: false, self_mute: false, self_deaf: false,
-            priority_speaker: false, recording: false
+            mute: false, 
+            deaf: false, 
+            suppress: false, 
+            self_mute: false, 
+            self_deaf: false,
+            priority_speaker: false, 
+            recording: false
         };
         
         info!("User authenticated: {} (session: {})", user.name, user.session);
         
-        {
-            let mut state = self.server.state.write().await;
-            state.users.insert(session_id, user.clone());
-            state.client_handlers.insert(session_id, self.tx.as_ref().unwrap().clone());
-            state.channels.get_mut(&0).unwrap().users.insert(session_id);
+        self.server.users.insert(session_id, user.clone());
+        self.server.client_handlers.insert(session_id, self.tx.as_ref().unwrap().clone());
+        
+        if let Some(mut root) = self.server.channels.get_mut(&0) {
+            root.users.insert(session_id);
         }
 
         self.send_crypto_setup().await?;
@@ -1013,56 +1089,48 @@ impl ClientHandler {
         Ok(())
     }
 
-   async fn ping_loop(
+    async fn ping_loop(
         session_id: u32, 
-        last_ping: Arc<RwLock<SystemTime>>, 
+        last_ping: Arc<tokio::sync::RwLock<SystemTime>>, 
         tx: ClientSender,
         shutdown_tx: mpsc::Sender<()>
     ) {
-        let mut interval = tokio::time::interval(Duration::from_secs(15));
-        loop {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        'monitor: loop {
             interval.tick().await;
             
             let last = *last_ping.read().await;
             if SystemTime::now().duration_since(last).unwrap_or_default() > Duration::from_secs(30) {
                 warn!("Session {} timed out - no ping received for 30+ seconds", session_id);
-                // Send shutdown signal to force connection close
-                let _ = shutdown_tx.send(()).await;
-                break;
+                break 'monitor; 
             }
 
             let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
             let ping = messages::Ping { timestamp, ..Default::default() };
-            let payload = ping.encode();
-            
-            let mut message = Vec::with_capacity(6 + payload.len());
-            message.put_u16(MessageType::Ping as u16);
-            message.put_u32(payload.len() as u32);
-            message.extend(&payload);
+            let payload = Bytes::from(ping.encode());
 
-            if tx.send(message).await.is_err() {
-                debug!("Failed to send ping, client likely disconnected.");
-                break;
+            if tx.send((MessageType::Ping, payload)).await.is_err() {
+                debug!("Session {} write channel closed, stopping ping loop", session_id);
+                break 'monitor;
             }
-            debug!("Sent ping to session {}", session_id);
         }
+        
+        let _ = shutdown_tx.send(()).await;
     }
-    
+      
     async fn send_crypto_setup(&self) -> Result<()> {
         let crypto = messages::CryptSetup {
-            key: rand::thread_rng().gen::<[u8; 16]>().to_vec(),
-            client_nonce: rand::thread_rng().gen::<[u8; 16]>().to_vec(),
-            server_nonce: rand::thread_rng().gen::<[u8; 16]>().to_vec(),
+            key: rand::thread_rng().r#gen::<[u8; 16]>().to_vec(),
+            client_nonce: rand::thread_rng().r#gen::<[u8; 16]>().to_vec(),
+            server_nonce: rand::thread_rng().r#gen::<[u8; 16]>().to_vec(),
         };
-        self.send_message(MessageType::CryptSetup, crypto.encode()).await?;
+        self.send_message(MessageType::CryptSetup, Bytes::from(crypto.encode())).await?;
         debug!("Sent CryptSetup to session {:?}", self.session_id);
         Ok(())
     }
-    
+      
     async fn send_channel_states(&self) -> Result<()> {
-        let state = self.server.state.read().await;
-        debug!("Sending {} channel states", state.channels.len());
-        for channel in state.channels.values() {
+        let payloads: Vec<Bytes> = self.server.channels.iter().map(|channel| {
             let msg = messages::ChannelState {
                 channel_id: channel.channel_id,
                 parent: if channel.parent_id < 0 { None } else { Some(channel.parent_id as u32) },
@@ -1072,30 +1140,41 @@ impl ClientHandler {
                 temporary: channel.temporary,
                 position: channel.position,
             };
-            self.send_message(MessageType::ChannelState, msg.encode()).await?;
+            Bytes::from(msg.encode())
+        }).collect();
+
+        for payload in payloads {
+            self.send_message(MessageType::ChannelState, payload).await?;
         }
         Ok(())
     }
 
     async fn send_user_states(&self) -> Result<()> {
-        let state = self.server.state.read().await;
-        debug!("Sending {} user states", state.users.len());
-        for user in state.users.values() {
+        let payloads: Vec<Bytes> = self.server.users.iter().map(|user| {
             let msg = messages::UserState {
                 session: user.session,
                 actor: None,
                 name: user.name.clone(),
                 channel_id: user.channel_id,
-                mute: user.mute, deaf: user.deaf, suppress: user.suppress,
-                self_mute: user.self_mute, self_deaf: user.self_deaf,
-                priority_speaker: user.priority_speaker, recording: user.recording,
-                comment: "".to_string(), hash: "".to_string(),
+                mute: Some(user.mute), 
+                deaf: Some(user.deaf), 
+                suppress: Some(user.suppress),
+                self_mute: Some(user.self_mute), 
+                self_deaf: Some(user.self_deaf),
+                priority_speaker: Some(user.priority_speaker), 
+                recording: Some(user.recording),
+                comment: "".to_string(), 
+                hash: "".to_string(),
             };
-            self.send_message(MessageType::UserState, msg.encode()).await?;
+            Bytes::from(msg.encode())
+        }).collect();
+
+        for payload in payloads {
+            self.send_message(MessageType::UserState, payload).await?;
         }
         Ok(())
     }
-    
+      
     async fn send_server_sync(&self) -> Result<()> {
         let msg = messages::ServerSync {
             session: self.session_id.unwrap(),
@@ -1103,23 +1182,27 @@ impl ClientHandler {
             welcome_text: "Welcome to the Mumble Server!".to_string(),
             permissions: 0xF00FF,
         };
-        self.send_message(MessageType::ServerSync, msg.encode()).await?;
+        self.send_message(MessageType::ServerSync, Bytes::from(msg.encode())).await?;
         info!("Sent ServerSync - Client {:?} fully synchronized", self.session_id);
         Ok(())
     }
-    
+      
     async fn broadcast_user_state(&self, user: User) -> Result<()> {
         let msg = messages::UserState {
             session: user.session,
             actor: None,
             name: user.name.clone(),
             channel_id: user.channel_id,
-            mute: user.mute, deaf: user.deaf, suppress: user.suppress,
-            self_mute: user.self_mute, self_deaf: user.self_deaf,
-            priority_speaker: user.priority_speaker, recording: user.recording,
+            mute: Some(user.mute), 
+            deaf: Some(user.deaf), 
+            suppress: Some(user.suppress),
+            self_mute: Some(user.self_mute), 
+            self_deaf: Some(user.self_deaf),
+            priority_speaker: Some(user.priority_speaker), 
+            recording: Some(user.recording),
             comment: "".to_string(), hash: "".to_string(),
         };
-        self.server.broadcast_message(MessageType::UserState, msg.encode(), self.session_id).await;
+        self.server.broadcast_message(MessageType::UserState, Bytes::from(msg.encode()), self.session_id).await;
         debug!("Broadcasted UserState for {}", user.name);
         Ok(())
     }
@@ -1129,10 +1212,10 @@ impl ClientHandler {
         *self.last_ping.write().await = SystemTime::now();
 
         let response = messages::Ping { timestamp: ping.timestamp, ..Default::default() };
-        self.send_message(MessageType::Ping, response.encode()).await?;
+        self.send_message(MessageType::Ping, Bytes::from(response.encode())).await?;
         Ok(())
     }
-    
+      
     async fn handle_udp_tunnel(&self, payload: &[u8]) -> Result<()> {
         if payload.is_empty() { return Ok(()); }
         let session_id = match self.session_id {
@@ -1140,42 +1223,36 @@ impl ClientHandler {
             None => return Ok(()),
         };
 
-        // Don't forward pings
         let packet_type = (payload[0] >> 5) & 0x07;
         if packet_type == 1 { return Ok(()); }
 
         let session_varint = protobuf::encode_varint(session_id as u64);
-        
-        let mut broadcast_payload = Vec::new();
-        broadcast_payload.push(payload[0]); // Header
+          
+        let mut broadcast_payload = Vec::with_capacity(1 + session_varint.len() + payload.len() - 1);
+        broadcast_payload.push(payload[0]); 
         broadcast_payload.extend(&session_varint);
-        broadcast_payload.extend_from_slice(&payload[1..]); // Sequence number + data
-        
-        let state = self.server.state.read().await;
-        let user = match state.users.get(&session_id) {
-            Some(u) => u.clone(),
+        broadcast_payload.extend_from_slice(&payload[1..]);
+        let broadcast_bytes = Bytes::from(broadcast_payload);
+          
+        let user_channel_id = match self.server.users.get(&session_id) {
+            Some(u) => u.channel_id,
             None => return Ok(()),
         };
-        
+          
         let mut recipients = HashSet::new();
-        if let Some(channel) = state.channels.get(&user.channel_id) {
-             recipients.extend(channel.users.iter());
-             for link_id in &channel.links {
-                if let Some(linked_channel) = state.channels.get(link_id) {
+        if let Some(channel) = self.server.channels.get(&user_channel_id) {
+            recipients.extend(channel.users.iter());
+            for link_id in &channel.links {
+                if let Some(linked_channel) = self.server.channels.get(link_id) {
                     recipients.extend(linked_channel.users.iter());
                 }
-             }
+            }
         }
 
-        let mut message = Vec::with_capacity(6 + broadcast_payload.len());
-        message.put_u16(MessageType::UdpTunnel as u16);
-        message.put_u32(broadcast_payload.len() as u32);
-        message.extend(&broadcast_payload);
-        
         for recipient_session in recipients {
             if recipient_session == session_id { continue; }
-            if let Some(handler) = state.client_handlers.get(&recipient_session) {
-                let _ = handler.send(message.clone()).await;
+            if let Some(handler) = self.server.client_handlers.get(&recipient_session) {
+                let _ = handler.send((MessageType::UdpTunnel, broadcast_bytes.clone())).await;
             }
         }
 
@@ -1185,11 +1262,11 @@ impl ClientHandler {
     async fn handle_permission_query(&self, payload: &[u8]) -> Result<()> {
         let query = messages::PermissionQuery::decode(payload)?;
         info!("PermissionQuery from session {:?} for channel {}", self.session_id, query.channel_id);
-        
-        let permissions = 0x1 | 0x2 | 0x4 | 0x8 | 0x100 | 0x200 | 0x40 | 0x400; // Various perms
+          
+        let permissions = 0x1 | 0x2 | 0x4 | 0x8 | 0x100 | 0x200 | 0x40 | 0x400;
         let response = messages::PermissionQuery { channel_id: query.channel_id, permissions, flush: false };
 
-        self.send_message(MessageType::PermissionQuery, response.encode()).await?;
+        self.send_message(MessageType::PermissionQuery, Bytes::from(response.encode())).await?;
         debug!("Sent permissions 0x{:X} for channel {}", permissions, query.channel_id);
         Ok(())
     }
@@ -1197,14 +1274,14 @@ impl ClientHandler {
     async fn handle_codec_version(&self, payload: &[u8]) -> Result<()> {
         let codec = messages::CodecVersion::decode(payload)?;
         info!("Client codec: alpha={}, beta={}, prefer_alpha={}, opus={}", codec.alpha, codec.beta, codec.prefer_alpha, codec.opus);
-        
+          
         let response = messages::CodecVersion {
             alpha: -2147483637,
             beta: -2147483632,
             prefer_alpha: true,
             opus: true,
         };
-        self.send_message(MessageType::CodecVersion, response.encode()).await?;
+        self.send_message(MessageType::CodecVersion, Bytes::from(response.encode())).await?;
         debug!("Sent codec version (Opus preferred)");
         Ok(())
     }
@@ -1213,50 +1290,44 @@ impl ClientHandler {
         let msg = messages::TextMessage::decode(payload)?;
         let session_id = self.session_id.unwrap_or(0);
 
-        let state = self.server.state.read().await;
-        let sender_name = state.users.get(&session_id).map_or_else(|| format!("Session {}", session_id), |u| u.name.clone());
+        let sender_name = self.server.users.get(&session_id).map_or_else(|| format!("Session {}", session_id), |u| u.name.clone());
         info!("Text message from {} (session {}): '{}'", sender_name, session_id, msg.message);
-        
+          
         let mut recipients = HashSet::new();
         if !msg.channel_id.is_empty() {
             for channel_id in &msg.channel_id {
-                if let Some(channel) = state.channels.get(channel_id) {
+                if let Some(channel) = self.server.channels.get(channel_id) {
                     recipients.extend(channel.users.iter());
                 }
             }
-        } else if let Some(user) = state.users.get(&session_id) {
-            if let Some(channel) = state.channels.get(&user.channel_id) {
+        } else if let Some(user) = self.server.users.get(&session_id) {
+            if let Some(channel) = self.server.channels.get(&user.channel_id) {
                 recipients.extend(channel.users.iter());
             }
         }
-        
+          
         let response = messages::TextMessage {
             actor: session_id,
             message: msg.message,
             channel_id: msg.channel_id,
             ..Default::default()
         };
-        let response_payload = response.encode();
-
-        let mut message = Vec::with_capacity(6 + response_payload.len());
-        message.put_u16(MessageType::TextMessage as u16);
-        message.put_u32(response_payload.len() as u32);
-        message.extend(&response_payload);
-        
+        let response_bytes = Bytes::from(response.encode());
+          
         for recipient_id in recipients {
-            if let Some(handler) = state.client_handlers.get(&recipient_id) {
-                let _ = handler.send(message.clone()).await;
+            if let Some(handler) = self.server.client_handlers.get(&recipient_id) {
+                let _ = handler.send((MessageType::TextMessage, response_bytes.clone())).await;
             }
         }
         Ok(())
     }
-    
+      
     async fn handle_user_stats(&self, payload: &[u8]) -> Result<()> {
         let stats_req = messages::UserStats::decode(payload)?;
         info!("UserStats request for session {}", stats_req.session);
-        
+          
         let response = messages::UserStats { session: stats_req.session };
-        self.send_message(MessageType::UserStats, response.encode()).await?;
+        self.send_message(MessageType::UserStats, Bytes::from(response.encode())).await?;
         debug!("Sent user stats for session {}", stats_req.session);
         Ok(())
     }
@@ -1265,67 +1336,67 @@ impl ClientHandler {
         let changes = messages::UserState::decode_changes(payload)?;
         info!("UserState change from session {:?}: {:?}", self.session_id, changes);
         let session_id = self.session_id.unwrap();
-        
+          
         let mut updated_user_state = None;
-        {
-            let mut state = self.server.state.write().await;
-            
-            // First, get the current user's state to determine old/new channels
-            let (user_name, old_channel_id) = if let Some(user) = state.users.get(&session_id) {
+
+        let (user_name, old_channel_id) = {
+            if let Some(user) = self.server.users.get(&session_id) {
                 (user.name.clone(), user.channel_id)
             } else {
-                return Ok(()); // User not found, can't proceed
-            };
+                return Ok(());
+            }
+        };
 
-            // Handle channel change
-            if let Some(&new_channel_id_u64) = changes.get("channel_id") {
-                let new_channel_id = new_channel_id_u64 as u32;
-                if old_channel_id != new_channel_id {
-                    // Remove from old channel
-                    if let Some(old_channel) = state.channels.get_mut(&old_channel_id) {
-                        old_channel.users.remove(&session_id);
-                    }
-                    // Add to new channel
-                    if let Some(new_channel) = state.channels.get_mut(&new_channel_id) {
-                        new_channel.users.insert(session_id);
-                    }
-                    info!("User {} moved from channel {} to {}", user_name, old_channel_id, new_channel_id);
+        if let Some(&new_channel_id_u64) = changes.get("channel_id") {
+            let new_channel_id = new_channel_id_u64 as u32;
+            if old_channel_id != new_channel_id {
+                if let Some(mut old_channel) = self.server.channels.get_mut(&old_channel_id) {
+                    old_channel.users.remove(&session_id);
                 }
+                if let Some(mut new_channel) = self.server.channels.get_mut(&new_channel_id) {
+                    new_channel.users.insert(session_id);
+                }
+                info!("User {} moved from channel {} to {}", user_name, old_channel_id, new_channel_id);
             }
+        }
 
-            // Now, apply all changes to the user object
-            if let Some(user) = state.users.get_mut(&session_id) {
-                 if let Some(&val) = changes.get("channel_id") { user.channel_id = val as u32; }
-                 if let Some(&val) = changes.get("self_mute") { user.self_mute = val != 0; }
-                 if let Some(&val) = changes.get("self_deaf") { user.self_deaf = val != 0; }
-                 // Add other state changes here if needed
-                 
-                 updated_user_state = Some(user.clone());
-            }
-        } // Lock is released here
+        if let Some(mut user) = self.server.users.get_mut(&session_id) {
+            if let Some(&val) = changes.get("channel_id") { user.channel_id = val as u32; }
+            if let Some(&val) = changes.get("self_mute") { user.self_mute = val != 0; }
+            if let Some(&val) = changes.get("self_deaf") { user.self_deaf = val != 0; }
+            if let Some(&val) = changes.get("mute") { user.mute = val != 0; }
+            if let Some(&val) = changes.get("deaf") { user.deaf = val != 0; }
+            if let Some(&val) = changes.get("suppress") { user.suppress = val != 0; }
+            if let Some(&val) = changes.get("priority_speaker") { user.priority_speaker = val != 0; }
+            if let Some(&val) = changes.get("recording") { user.recording = val != 0; }
+            
+            updated_user_state = Some(user.clone());
+        } 
 
-
-        // Broadcast the final state after releasing the lock
         if let Some(updated_user) = updated_user_state {
             let state_msg = messages::UserState {
                 session: session_id,
                 actor: Some(session_id),
                 name: updated_user.name,
                 channel_id: updated_user.channel_id,
-                self_mute: updated_user.self_mute,
-                self_deaf: updated_user.self_deaf,
+                mute: Some(updated_user.mute),
+                deaf: Some(updated_user.deaf),
+                suppress: Some(updated_user.suppress),
+                self_mute: Some(updated_user.self_mute),
+                self_deaf: Some(updated_user.self_deaf),
+                priority_speaker: Some(updated_user.priority_speaker),
+                recording: Some(updated_user.recording),
                 ..Default::default()
             };
-            
-            self.server.broadcast_message(MessageType::UserState, state_msg.encode(), None).await;
+              
+            self.server.broadcast_message(MessageType::UserState, Bytes::from(state_msg.encode()), None).await;
             debug!("Broadcasted UserState change for session {}", session_id);
         }
-        
+          
         Ok(())
     }
 }
 
-// Helper functions for loading TLS certs and keys
 fn load_certs(filename: &str) -> Result<Vec<CertificateDer<'static>>> {
     let certfile = File::open(filename).map_err(|e| anyhow!("failed to open {}: {}", filename, e))?;
     let mut reader = BufReader::new(certfile);
@@ -1344,20 +1415,31 @@ fn load_private_key(filename: &str) -> Result<PrivateKeyDer<'static>> {
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+      
+    let args: Vec<String> = std::env::args().collect();
+    let mut password = None;
     
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--password" && i + 1 < args.len() {
+            password = Some(args[i + 1].clone());
+            i += 1;
+        }
+        i += 1;
+    }
+
     let host = "0.0.0.0";
-    let port = 64738;
+    let port = 31839;
     let addr = format!("{}:{}", host, port);
     let certfile = "server.crt";
     let keyfile = "server.key";
 
-    let server = Arc::new(MumbleServer::new());
+    let server = Arc::new(MumbleServer::new(password));
     server.init_root_channel().await;
     server.create_channel("General", 0).await;
     server.create_channel("Gaming", 0).await;
     server.create_channel("Music", 0).await;
-    
-    let state = server.state.read().await;
+      
     let separator = "=".repeat(60);
     info!("{}", separator);
     info!("Mumble Server Starting");
@@ -1367,9 +1449,8 @@ async fn main() -> Result<()> {
     info!("Port: {}", port);
     info!("Certificate: {}", certfile);
     info!("Key: {}", keyfile);
-    info!("Channels: {}", state.channels.len());
+    info!("Channels: {}", server.channels.len());
     info!("{}", separator);
-    drop(state);
 
     if let Err(e) = server.clone().start(&addr, certfile, keyfile).await {
         error!("Server error: {}", e);
