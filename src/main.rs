@@ -18,7 +18,7 @@ use tokio::time::timeout;
 use tokio_rustls::rustls::{pki_types::CertificateDer, pki_types::PrivateKeyDer, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::{Decoder, Encoder, Framed};
-
+ use std::hint::black_box;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 enum MessageType {
@@ -1022,7 +1022,7 @@ impl ClientHandler {
         Ok(())
     }
 
-    async fn handle_authenticate(&mut self, payload: &[u8]) -> Result<()> {
+	async fn handle_authenticate(&mut self, payload: &[u8]) -> Result<()> {
         if self.session_id.is_some() {
             warn!("Client at {} attempted to re-authenticate. Disconnecting.", self.addr);
             return Err(anyhow!("Re-authentication not allowed on active session"));
@@ -1032,7 +1032,8 @@ impl ClientHandler {
         info!("Authentication request: username={}, opus={}", auth.username, auth.opus);
 
         if let Some(server_password) = &self.server.password {
-            if auth.password != *server_password {
+            // FIX: Use constant-time comparison instead of `auth.password != *server_password`
+            if !constant_time_eq(auth.password.as_bytes(), server_password.as_bytes()) {
                 warn!("Client at {} rejected: Incorrect or missing password.", self.addr);
                 
                 let reject_msg = messages::Reject {
@@ -1047,7 +1048,6 @@ impl ClientHandler {
                 return Err(anyhow!("Authentication failed: wrong or missing password"));
             }
         }
-
         let session_id = self.server.allocate_session();
         debug!("Allocated session ID: {}", session_id);
         self.session_id = Some(session_id);
@@ -1309,7 +1309,7 @@ impl ClientHandler {
             }
         }
           
-        let response = messages::TextMessage {
+	let response = messages::TextMessage {
             actor: session_id,
             message: msg.message,
             channel_id: msg.channel_id,
@@ -1318,13 +1318,17 @@ impl ClientHandler {
         let response_bytes = Bytes::from(response.encode());
           
         for recipient_id in recipients {
+            // FIX: Prevent sending the message back to the person who sent it
+            if recipient_id == session_id { 
+                continue; 
+            }
+            
             if let Some(handler) = self.server.client_handlers.get(&recipient_id) {
                 let _ = handler.send((MessageType::TextMessage, response_bytes.clone())).await;
             }
         }
         Ok(())
-    }
-      
+    }      
     async fn handle_user_stats(&self, payload: &[u8]) -> Result<()> {
         let stats_req = messages::UserStats::decode(payload)?;
         info!("UserStats request for session {}", stats_req.session);
@@ -1460,4 +1464,21 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+
+    let mut result = 0;
+    for i in 0..a.len() {
+        // XOR (^) evaluates to 0 if the bytes are identical.
+        // OR (|) accumulates any differences without branching.
+        result |= a[i] ^ b[i];
+    }
+
+    // black_box prevents the compiler from outsmarting us and 
+    // replacing this loop with a short-circuiting `memcmp`.
+    black_box(result) == 0
 }
